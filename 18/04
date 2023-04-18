@@ -1,0 +1,285 @@
+#include <SoftwareSerial.h>
+#include <Arduino.h>
+#include "HX711.h"
+
+// Define pins
+const int LOADCELL_DOUT_PIN = 2;
+const int LOADCELL_SCK_PIN = 3;
+const int FORWARD_PIN = 4;
+const int REVERSE_PIN = 5;
+const int ON_BUTTON_PIN = 6;
+const int PAUSE_BUTTON_PIN = 7;
+
+// Define load thresholds
+float MAX_LOAD = 40.0; // Maximum load threshold in KG
+float MIN_LOAD = 38.0; // Minimum load threshold in KG
+
+float ACTIVE_MIN_LOAD = 38.0; // Initial minimum load threshold in KG
+float ACTIVE_MAX_LOAD = 40.0; // Maximum load threshold in KG
+
+// Define movement parameters
+const unsigned long MOVEMENT_DELAY = 200; // Delay in ms to allow winch movement
+const int STEP_DURATION = 500;            // Duration of each incremental step in ms
+const int WINCH_INCREMENT = 10;           // Incremental movement of the winch in KG
+
+// Initialize the HX711 scale object
+HX711 scale;
+
+// Define system state
+bool systemEnabled = false;
+bool systemPaused = false;
+
+// Button debounce parameters
+unsigned long lastButtonPressTime = 0;
+const unsigned int BUTTON_DEBOUNCE_DELAY = 50; // Button debounce delay in ms
+
+// Define winch movement state
+bool isMovingForward = false;
+bool isMovingBackward = false;
+unsigned long lastMoveTime = 0;
+
+// Define last ON button press time
+unsigned long lastOnButtonPress = 0;
+
+bool isDebounceDelayElapsed(unsigned long lastPressTime)
+{
+  return (millis() - lastPressTime >= BUTTON_DEBOUNCE_DELAY);
+}
+
+void setup()
+{
+  // Initialize serial communication
+  Serial.begin(57600);
+  Serial.println("HX711 Demo");
+
+  // Set pin modes
+  pinMode(FORWARD_PIN, OUTPUT);
+  pinMode(REVERSE_PIN, OUTPUT);
+  pinMode(ON_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(PAUSE_BUTTON_PIN, INPUT_PULLUP);
+
+  // Initialize the HX711 scale
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale(2325); // Set scale calibration value
+
+  Serial.println("Scale initialized:");
+
+  // Set default state of the relays to off
+  digitalWrite(FORWARD_PIN, HIGH);
+  digitalWrite(REVERSE_PIN, HIGH);
+
+  // Move the winch to find the 0-5 kg load range
+  Serial.println("Resetting load range to 0 - 5kg");
+  ACTIVE_MIN_LOAD = 0.0;
+  ACTIVE_MAX_LOAD = 5.0;
+  MIN_LOAD = ACTIVE_MIN_LOAD;
+  MAX_LOAD = ACTIVE_MAX_LOAD;
+}
+
+void stopWinch()
+{
+  digitalWrite(FORWARD_PIN, HIGH);
+  digitalWrite(REVERSE_PIN, HIGH);
+  isMovingForward = false;
+  isMovingBackward = false;
+}
+
+void moveWinch(int direction, int duration)
+{
+  if (direction == FORWARD_PIN)
+  {
+    digitalWrite(FORWARD_PIN, LOW);
+    digitalWrite(REVERSE_PIN, HIGH);
+    Serial.println("Moving winch forward");
+  }
+  else
+  {
+    digitalWrite(FORWARD_PIN, HIGH);
+    digitalWrite(REVERSE_PIN, LOW);
+    Serial.println("Moving winch backward");
+  }
+
+  delay(duration);
+
+  digitalWrite(FORWARD_PIN, HIGH);
+
+  digitalWrite(REVERSE_PIN, HIGH);
+}
+
+void resetLoadRange()
+{
+  // Move the winch to find the 0-5 kg load range
+  Serial.println("Resetting load range to 0 - 5kg");
+
+  MIN_LOAD = 0.0;
+  MAX_LOAD = 5.0;
+
+  stopWinch();
+  isMovingForward = false;
+  isMovingBackward = false;
+  digitalWrite(FORWARD_PIN, LOW);
+  digitalWrite(REVERSE_PIN, HIGH);
+
+  while (scale.get_units() < MAX_LOAD) {
+    // Move winch forward until MAX_LOAD is reached
+    if (!isMovingForward) {
+      digitalWrite(FORWARD_PIN, LOW);
+      digitalWrite(REVERSE_PIN, HIGH);
+      isMovingForward = true;
+    }
+    if (millis() - lastMoveTime >= STEP_DURATION) {
+      moveWinch(FORWARD_PIN, STEP_DURATION);
+      lastMoveTime = millis();
+    }
+  }
+  stopWinch();
+  isMovingForward = false;
+  isMovingBackward = false;
+}
+void loop() {
+  // Check if the ON button is pressed to start or resume the system
+  if (digitalRead(ON_BUTTON_PIN) == LOW && isDebounceDelayElapsed(lastButtonPressTime)) {
+    systemEnabled = true;
+    systemPaused = false;
+    lastOnButtonPress = millis();
+    Serial.println("ON button pressed, system started or resumed");
+  }
+
+  // Check for PAUSE button press
+  if (digitalRead(PAUSE_BUTTON_PIN) == LOW && isDebounceDelayElapsed(lastButtonPressTime)) {
+    systemPaused = true;
+    systemEnabled = false;
+    lastButtonPressTime = millis();
+    Serial.println("PAUSE button pressed, system paused");
+
+    // Stop winch movement
+    stopWinch();
+  }
+
+  if (systemEnabled && !systemPaused) {
+    // Get load cell reading in kilograms
+    float weight = scale.get_units();
+
+    // Output weight to serial monitor
+    Serial.print("Weight: ");
+    Serial.print(weight);
+    Serial.println(" kg");
+
+    unsigned long currentMillis = millis();
+
+    // Determine which direction to move the winch
+    if (weight < MIN_LOAD && !isMovingForward) { // Load is too low, move winch forward
+      if (currentMillis - lastMoveTime >= MOVEMENT_DELAY) { // Check if the winch has been moved within the MOVEMENT_DELAY window
+        moveWinch(FORWARD_PIN, STEP_DURATION);
+        lastMoveTime = currentMillis;
+        isMovingForward = true;
+      }
+    } else if (weight > MAX_LOAD && !isMovingBackward) { // Load is too high, move winch backwards
+      if (currentMillis - lastMoveTime >= MOVEMENT_DELAY) { // Check if the winch has been moved within the MOVEMENT_DELAY window
+        moveWinch(REVERSE_PIN, STEP_DURATION);
+        lastMoveTime = currentMillis;
+        isMovingBackward = true;
+      }
+    } else { // Load is within acceptable range, stop winch and reset movement state
+      Serial.println("Load is within acceptable range, stopping winch");
+
+      stopWinch();
+      lastMoveTime = currentMillis;
+      isMovingForward = false;
+      isMovingBackward = false;
+    }
+
+    // Incrementally move the winch in the current direction if applicable
+    if (isMovingForward || isMovingBackward) {
+      if (currentMillis - lastMoveTime >= STEP_DURATION) { // Check if the step duration has elapsed
+        moveWinch(isMovingForward ? FORWARD_PIN : REVERSE_PIN, STEP_DURATION);
+        lastMoveTime = currentMillis;
+      }
+    }
+  } else { // System is disabled or paused, stop winch and reset movement state
+    stopWinch();
+    isMovingForward = false;
+    isMovingBackward = false;
+  }
+}
+void loop()
+{
+  // Check if the ON button is pressed to start or resume the system
+  if (digitalRead(ON_BUTTON_PIN) == LOW && isDebounceDelayElapsed(lastButtonPressTime))
+  {
+    systemEnabled = true;
+    systemPaused = false;
+    lastOnButtonPress = millis();
+    Serial.println("ON button pressed, system started or resumed");
+  }
+
+  // Check for PAUSE button press
+  if (digitalRead(PAUSE_BUTTON_PIN) == LOW && isDebounceDelayElapsed(lastButtonPressTime))
+  {
+    systemPaused = true;
+    systemEnabled = false;
+    lastButtonPressTime = millis();
+    Serial.println("PAUSE button pressed, system paused");
+
+    // Stop winch movement
+    stopWinch();
+  }
+
+  if (systemEnabled && !systemPaused)
+  {
+    // Get load cell reading in kilograms
+    float weight = scale.get_units();
+
+    // Output weight to serial monitor
+    Serial.print("Weight: ");
+    Serial.print(weight);
+    Serial.println(" kg");
+
+    unsigned long currentMillis = millis();
+
+    // Determine which direction to move the winch
+    if (weight < MIN_LOAD && !isMovingForward)
+    { // Load is too low, move winch forward
+      if (currentMillis - lastMoveTime >= MOVEMENT_DELAY)
+      { // Check if the winch has been moved within the MOVEMENT_DELAY window
+        moveWinch(FORWARD_PIN, STEP_DURATION);
+        lastMoveTime = currentMillis;
+        isMovingForward = true;
+      }
+    }
+    else if (weight > MAX_LOAD && !isMovingBackward)
+    { // Load is too high, move winch backwards
+      if (currentMillis - lastMoveTime >= MOVEMENT_DELAY)
+      { // Check if the winch has been moved within the MOVEMENT_DELAY window
+        moveWinch(REVERSE_PIN, STEP_DURATION);
+        lastMoveTime = currentMillis;
+        isMovingBackward = true;
+      }
+    }
+    else
+    { // Load is within acceptable range, stop winch and reset movement state
+      Serial.println("Load is within acceptable range, stopping winch");
+
+      stopWinch();
+      lastMoveTime = currentMillis;
+      isMovingForward = false;
+      isMovingBackward = false;
+    }
+
+    // Incrementally move the winch in the current direction if applicable
+    if (isMovingForward || isMovingBackward)
+    {
+      if (currentMillis - lastMoveTime >= STEP_DURATION)
+      { // Check if the step duration has elapsed
+        moveWinch(isMovingForward ? FORWARD_PIN : REVERSE_PIN, STEP_DURATION);
+        lastMoveTime = currentMillis;
+      }
+    }
+  }
+  else
+  { // System is disabled or paused, stop winch and reset movement state
+    stopWinch();
+    isMovingForward = false;
+    isMovingBackward = false;
+  }
+}
